@@ -2,7 +2,6 @@ name: paylocity-daily-sync
 
 "on":
   schedule:
-    # 11:00 UTC = 5:00 AM MT (DST) / 4:00 AM MT (winter) — corre antes del dailyDualSystemCheck GAS (1 PM MT)
     - cron: '0 11 * * *'
   workflow_dispatch:
 
@@ -21,6 +20,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache Paylocity storage_state
+        id: cache-state
+        uses: actions/cache@v4
+        with:
+          path: storage_state.json
+          key: paylocity-state-${{ github.run_id }}
+          restore-keys: |
+            paylocity-state-
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -31,6 +39,9 @@ jobs:
       - name: Run scrape + POST to GAS
         env:
           PAYLOCITY_STORAGE_STATE_B64: ${{ secrets.PAYLOCITY_STORAGE_STATE_B64 }}
+          PAYLOCITY_COMPANY_ID: ${{ secrets.PAYLOCITY_COMPANY_ID }}
+          PAYLOCITY_USERNAME: ${{ secrets.PAYLOCITY_USERNAME }}
+          PAYLOCITY_PASSWORD: ${{ secrets.PAYLOCITY_PASSWORD }}
           WHAPI_TOKEN: ${{ secrets.WHAPI_TOKEN }}
           ADMIN_PHONE: ${{ secrets.ADMIN_PHONE }}
           GAS_URL: ${{ secrets.GAS_URL }}
@@ -44,5 +55,6 @@ jobs:
           path: |
             *.log
             screenshot*.png
+            storage_state.json
           if-no-files-found: ignore
           retention-days: 7

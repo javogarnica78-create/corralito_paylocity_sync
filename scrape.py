@@ -1,18 +1,17 @@
 """
 Paylocity → GAS Horarios scraper (cloud, GitHub Actions).
 
-Flujo:
-1. Carga storage_state.json (cookies) desde env var PAYLOCITY_STORAGE_STATE_B64
-2. Playwright Chromium navega a EmployeeSearch multi-co
-3. Extrae employees (co, first, last, hireDate, employeeId, jobTitle, status) del Kendo grid
-4. POST a GAS_URL endpoint action=ingestPaylocityRoster
-5. Si session expirada → WhatsApp alerta vía Whapi y exit 1
-
-Exit codes:
-  0 = success
-  1 = session expired
-  2 = scrape parser error
-  3 = POST failed
+Flow:
+1. Restaurar storage_state.json desde cache GH Actions (si existe) → tiene trust device cookie
+2. Lanzar Playwright Chromium con ese state
+3. Navegar a EmployeeSearch:
+   - Si carga el grid → ya logueado, seguir
+   - Si redirect a login → hacer login fresco con Company ID + Username + Password
+     * Si Paylocity exige MFA SMS → Whapi alert + exit 1 (necesita bootstrap manual con trust device)
+     * Si trust device cookie aún sirve → entra directo
+4. Extraer empleados del Kendo grid
+5. POST a GAS_URL action=ingestPaylocityRoster
+6. Guardar storage_state.json actualizado (siguiente run usa cookies frescos)
 """
 import base64
 import json
@@ -22,23 +21,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-GAS_URL = os.environ.get(
-    "GAS_URL",
-    "https://script.google.com/macros/s/AKfycbxsUvNqY-Uih5_-AtVzsDSHJW9OXjJpxtsjIrJtSXee5gwo5YJSQ3LSt-Z-fWF6sSLP/exec",
-)
+GAS_URL = os.environ.get("GAS_URL", "")
 SCRAPE_URL = "https://login.paylocity.com/Escher/Escher_WebUI/EmployeeSearch/home/index?uniquecode=csEmployeeSearch&area=multico&view=EmployeeSearch"
+LOGIN_URL = "https://access.paylocity.com/"
 WHAPI_TOKEN = os.environ.get("WHAPI_TOKEN", "")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE", "")
+COMPANY_ID = os.environ.get("PAYLOCITY_COMPANY_ID", "")
+USERNAME = os.environ.get("PAYLOCITY_USERNAME", "")
+PASSWORD = os.environ.get("PAYLOCITY_PASSWORD", "")
+
+STATE_PATH = Path("storage_state.json")  # persisted via actions/cache
 
 CO_MAP = {
-    "103204": "doniphan",
-    "103206": "zaragoza",
-    "115148": "airway",
-    "169447": "casino",
-    "169448": "weso",
-    "169450": "lubbock",
+    "103204": "doniphan", "103206": "zaragoza", "115148": "airway",
+    "169447": "casino", "169448": "weso", "169450": "lubbock",
 }
 
 
@@ -54,11 +52,7 @@ def whapi_alert(msg):
     try:
         requests.post(
             "https://gate.whapi.cloud/messages/text",
-            headers={
-                "Authorization": f"Bearer {WHAPI_TOKEN}",
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
+            headers={"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
             json={"to": ADMIN_PHONE, "body": msg},
             timeout=20,
         )
@@ -66,50 +60,123 @@ def whapi_alert(msg):
         log(f"whapi err: {e}")
 
 
-def load_storage_state():
-    """Decode storage_state from env var (base64 of JSON) and write to temp file."""
+def load_state():
+    """Try restore state from B64 secret OR existing file. Returns path or None."""
+    # 1) Existing file (from cache)
+    if STATE_PATH.exists() and STATE_PATH.stat().st_size > 100:
+        log(f"Using cached state: {STATE_PATH} ({STATE_PATH.stat().st_size}b)")
+        return str(STATE_PATH)
+    # 2) Bootstrap from B64 secret
     b64 = os.environ.get("PAYLOCITY_STORAGE_STATE_B64", "")
-    if not b64:
-        raise RuntimeError("Missing PAYLOCITY_STORAGE_STATE_B64 env var")
-    state = base64.b64decode(b64).decode("utf-8")
-    p = Path("/tmp/storage_state.json") if os.name != "nt" else Path(os.environ.get("TEMP", ".")) / "storage_state.json"
-    p.write_text(state, encoding="utf-8")
-    return str(p)
+    if b64 and len(b64) > 100:
+        try:
+            data = base64.b64decode(b64)
+            STATE_PATH.write_bytes(data)
+            log(f"Bootstrapped state from secret B64 ({len(data)}b)")
+            return str(STATE_PATH)
+        except Exception as e:
+            log(f"B64 decode failed: {e}")
+    log("No state available — fresh login needed")
+    return None
 
 
-def scrape_employees(state_path):
-    """Run Playwright, navigate, return list[dict]."""
+def perform_login(page):
+    """Returns True on successful EmployeeSearch entry, False if MFA blocked."""
+    if not (COMPANY_ID and USERNAME and PASSWORD):
+        log("Missing creds in env")
+        return False
+    log("Going to login page...")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    # Wait for company id field — name attribute may vary by language ('CompanyId')
+    for sel in ['input[name="CompanyId"]', 'input[name="companyId"]', 'input[id*="Company"]']:
+        try:
+            page.wait_for_selector(sel, timeout=15000)
+            page.fill(sel, COMPANY_ID)
+            break
+        except PWTimeoutError:
+            continue
+    for sel in ['input[name="Username"]', 'input[name="username"]']:
+        try:
+            page.fill(sel, USERNAME, timeout=8000)
+            break
+        except Exception:
+            continue
+    for sel in ['input[name="Password"]', 'input[name="password"]', 'input[type="password"]']:
+        try:
+            page.fill(sel, PASSWORD, timeout=8000)
+            break
+        except Exception:
+            continue
+    # Click submit
+    for sel in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("Acceder")']:
+        try:
+            page.click(sel, timeout=5000)
+            break
+        except Exception:
+            continue
+    # Wait for either MFA challenge or EmployeeSearch / portal home
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        pass
+    cur = page.url.lower()
+    content = page.content().lower()
+    if "challenge" in cur or "mfa" in cur or "verify" in cur or "security code" in content or "código de seguridad" in content or "verification code" in content:
+        log(f"MFA challenge detected at {page.url}")
+        return False
+    log(f"After login URL: {page.url}")
+    return True
+
+
+def scrape_employees():
+    state_path = load_state()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = browser.new_context(storage_state=state_path, user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        ))
+        ctx_kwargs = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "viewport": {"width": 1366, "height": 800},
+        }
+        if state_path:
+            ctx_kwargs["storage_state"] = state_path
+        context = browser.new_context(**ctx_kwargs)
         page = context.new_page()
-        log(f"Navigating to EmployeeSearch...")
+        log("Navigating to EmployeeSearch...")
         page.goto(SCRAPE_URL, wait_until="domcontentloaded", timeout=90000)
 
-        # Detect session expiration
+        # Detect if redirected to login
         try:
-            page.wait_for_selector("#EmployeeSearchGrid", timeout=30000)
-        except Exception:
-            cur = page.url
-            if "access.paylocity.com" in cur or "login" in cur.lower():
-                log(f"Session expired → {cur}")
-                whapi_alert(
-                    "⚠️ Paylocity session expirada en GitHub Action.\n"
-                    "Hay que refrescar storage_state. Avísale al admin."
-                )
-                browser.close()
-                sys.exit(1)
-            log(f"Grid no apareció. URL actual: {cur}")
-            html = page.content()[:2000]
-            log(f"HTML head: {html}")
-            browser.close()
-            sys.exit(2)
+            page.wait_for_selector("#EmployeeSearchGrid", timeout=12000)
+            logged_in = True
+        except PWTimeoutError:
+            cur = page.url.lower()
+            log(f"No grid yet. URL: {page.url}")
+            if "access.paylocity" in cur or "login" in cur or "challenge" in cur:
+                log("Detected login page — attempting fresh login")
+                logged_in = perform_login(page)
+                if logged_in:
+                    page.goto(SCRAPE_URL, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        page.wait_for_selector("#EmployeeSearchGrid", timeout=20000)
+                    except Exception:
+                        logged_in = False
+            else:
+                logged_in = False
 
-        # Configure page size to 2000 + read all rows
-        log("Loading all rows from Kendo grid...")
+        if not logged_in:
+            log("Login failed / MFA challenge")
+            whapi_alert(
+                "⚠️ Paylocity cloud login bloqueado (MFA SMS).\n"
+                "Hay que bootstrap: corre export_state_local.py local marcando 'Trust device' "
+                "y sube el storage_state.b64 fresco."
+            )
+            try:
+                page.screenshot(path="screenshot_login_fail.png")
+            except Exception:
+                pass
+            browser.close()
+            sys.exit(1)
+
+        log("Logged in OK, loading grid rows...")
         try:
             employees = page.evaluate("""
                 async () => {
@@ -133,9 +200,16 @@ def scrape_employees(state_path):
                 }
             """)
         except Exception as e:
-            log(f"Kendo extraction failed: {e}")
+            log(f"Kendo extract error: {e}")
             browser.close()
             sys.exit(2)
+
+        # Persist fresh state for next run
+        try:
+            context.storage_state(path=str(STATE_PATH))
+            log(f"Persisted state to {STATE_PATH} ({STATE_PATH.stat().st_size}b)")
+        except Exception as e:
+            log(f"Save state err: {e}")
         browser.close()
         return employees
 
@@ -156,17 +230,14 @@ def post_to_gas(employees):
         })
     active = sum(1 for x in payload_emps if x["status"] == "active")
     log(f"Posting {active} active / {len(payload_emps)} total → GAS")
-
     payload = {
         "action": "ingestPaylocityRoster",
         "scrapedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "employees": payload_emps,
     }
     try:
-        r = requests.post(GAS_URL, json=payload, timeout=120,
-                          headers={"Content-Type": "application/json"})
-        body = r.text
-        log(f"GAS response ({r.status_code}): {body[:500]}")
+        r = requests.post(GAS_URL, json=payload, timeout=120, headers={"Content-Type": "application/json"})
+        log(f"GAS response ({r.status_code}): {r.text[:400]}")
         try:
             j = r.json()
             if j.get("success"):
@@ -176,7 +247,6 @@ def post_to_gas(employees):
             log(f"GAS error: {j.get('error')}")
             return False
         except Exception:
-            log("Respuesta no JSON")
             return r.status_code == 200
     except Exception as e:
         log(f"POST exc: {e}")
@@ -185,26 +255,19 @@ def post_to_gas(employees):
 
 def main():
     log("Starting Paylocity scrape (cloud)")
-    state_path = load_storage_state()
-    employees = scrape_employees(state_path)
+    employees = scrape_employees()
     log(f"Scraped {len(employees)} raw employees")
     if not employees:
-        whapi_alert("⚠️ Paylocity scrape: 0 employees. Algo cambió en el portal.")
+        whapi_alert("⚠️ Paylocity scrape: 0 employees.")
         return 2
-
-    # Breakdown por CO
     by_co = {}
     for e in employees:
-        by_co.setdefault(e.get("co", "?"), 0)
-        by_co[e["co"]] += 1
+        by_co[e.get("co", "?")] = by_co.get(e.get("co", "?"), 0) + 1
     for co, cnt in sorted(by_co.items()):
-        store = CO_MAP.get(co, "?")
-        log(f"  CO {co} ({store}): {cnt}")
-
+        log(f"  CO {co} ({CO_MAP.get(co, '?')}): {cnt}")
     if not post_to_gas(employees):
         whapi_alert("⚠️ Paylocity scrape OK pero POST a GAS falló.")
         return 3
-
     log("DONE")
     return 0
 

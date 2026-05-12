@@ -26,8 +26,13 @@ PAYLOCITY_URL = "https://login.paylocity.com/Escher/Escher_WebUI/EmployeeSearch/
 
 def main():
     print(f"Profile: {PROFILE_DIR}")
-    print("Abriendo Chromium VISIBLE. Loguéate en Paylocity con tu MFA.")
-    print("Cuando veas la lista de employees (EmployeeSearch grid), CIERRA la ventana.")
+    print("Abriendo Chromium VISIBLE en Paylocity.")
+    print()
+    print("PASOS:")
+    print("  1. Loguéate en Paylocity con MFA")
+    print("  2. Espera a que cargue la lista de empleados (EmployeeSearch grid)")
+    print("  3. *NO cierres la ventana de Chrome todavía*")
+    print("  4. Vuelve a esta terminal y presiona ENTER")
     print()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
@@ -37,22 +42,27 @@ def main():
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(PAYLOCITY_URL)
-        print("Esperando que cierres la ventana de Chrome...")
-        # Wait until user closes browser window
-        try:
-            page.wait_for_event("close", timeout=600000)  # 10 min max
-        except Exception:
-            pass
-        # Save state (works even if context still open)
+        input("\n>>> Cuando veas la lista de empleados en Chrome, PRESIONA ENTER aquí <<<\n")
+        # Save state BEFORE closing context
         try:
             ctx.storage_state(path=str(STATE_OUT))
+            print(f"✓ Saved {STATE_OUT}")
         except Exception as e:
-            print(f"WARN saving state: {e}")
+            print(f"ERROR saving state: {e}")
+            sys.exit(2)
         try:
             ctx.close()
         except Exception:
             pass
-    print(f"Wrote {STATE_OUT}")
+    # Validate
+    import json as _json
+    state = _json.loads(STATE_OUT.read_text(encoding="utf-8"))
+    cookies = state.get("cookies", [])
+    pay_cookies = [c for c in cookies if "paylocity" in c.get("domain", "")]
+    print(f"Total cookies: {len(cookies)}, Paylocity cookies: {len(pay_cookies)}")
+    if len(pay_cookies) < 3:
+        print("⚠️ Pocas cookies Paylocity — login pudo no haberse completado. Repite el proceso.")
+        sys.exit(3)
 
     raw = STATE_OUT.read_bytes()
     b64 = base64.b64encode(raw).decode("ascii")
