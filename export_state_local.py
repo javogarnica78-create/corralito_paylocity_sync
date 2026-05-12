@@ -18,21 +18,40 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-PROFILE_DIR = r"C:\Users\Javo\Jg Dropbox\javier garnica\Z-Claude\paylocity_pw_profile"
+PROFILE_DIR = r"C:\Users\Javo\paylocity_login_profile"  # profile dedicado para este flow
 STATE_OUT = Path(__file__).parent / "storage_state.json"
 B64_OUT = Path(__file__).parent / "storage_state.b64"
+PAYLOCITY_URL = "https://login.paylocity.com/Escher/Escher_WebUI/EmployeeSearch/home/index?uniquecode=csEmployeeSearch&area=multico&view=EmployeeSearch"
 
 
 def main():
-    print(f"Opening Playwright persistent context: {PROFILE_DIR}")
+    print(f"Profile: {PROFILE_DIR}")
+    print("Abriendo Chromium VISIBLE. Loguéate en Paylocity con tu MFA.")
+    print("Cuando veas la lista de employees (EmployeeSearch grid), CIERRA la ventana.")
+    print()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR,
-            headless=False,  # visible so user can verify session if needed
+            headless=False,
+            viewport={"width": 1280, "height": 800},
         )
-        # Just save state and close
-        ctx.storage_state(path=str(STATE_OUT))
-        ctx.close()
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(PAYLOCITY_URL)
+        print("Esperando que cierres la ventana de Chrome...")
+        # Wait until user closes browser window
+        try:
+            page.wait_for_event("close", timeout=600000)  # 10 min max
+        except Exception:
+            pass
+        # Save state (works even if context still open)
+        try:
+            ctx.storage_state(path=str(STATE_OUT))
+        except Exception as e:
+            print(f"WARN saving state: {e}")
+        try:
+            ctx.close()
+        except Exception:
+            pass
     print(f"Wrote {STATE_OUT}")
 
     raw = STATE_OUT.read_bytes()
