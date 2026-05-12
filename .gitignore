@@ -1,0 +1,8 @@
+storage_state.json
+storage_state.b64
+_extract_*.py
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log
