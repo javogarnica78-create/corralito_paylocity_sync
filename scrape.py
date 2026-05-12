@@ -106,13 +106,13 @@ def whapi_request_mfa_code():
         return None
     # Poll for incoming
     log("Esperando código MFA por WhatsApp (8 min max)...")
-    chat_id = ADMIN_PHONE + "@s.whatsapp.net"
+    chat_id = f"{ADMIN_PHONE}@s.whatsapp.net"
     deadline = sent_at + 8 * 60
     while time.time() < deadline:
         time.sleep(10)
         try:
             r = requests.get(
-                f"https://gate.whapi.cloud/messages/list/{ADMIN_PHONE}",
+                f"https://gate.whapi.cloud/messages/list/{chat_id}",
                 headers={"Authorization": f"Bearer {WHAPI_TOKEN}", "User-Agent": "Mozilla/5.0"},
                 params={"count": 10},
                 timeout=20,
