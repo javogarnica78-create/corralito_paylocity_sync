@@ -1,6 +1,6 @@
 name: paylocity-daily-sync
 
-on:
+"on":
   schedule:
     # 11:00 UTC = 5:00 AM MT (DST) / 4:00 AM MT (winter) — corre antes del dailyDualSystemCheck GAS (1 PM MT)
     - cron: '0 11 * * *'
