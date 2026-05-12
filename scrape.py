@@ -80,6 +80,134 @@ def load_state():
     return None
 
 
+import re
+import time
+
+
+def whapi_request_mfa_code():
+    """Send WA asking user to forward SMS code. Poll Whapi inbox for 6-digit reply."""
+    if not WHAPI_TOKEN or not ADMIN_PHONE:
+        log("No Whapi — cannot relay MFA")
+        return None
+    sent_at = int(time.time())
+    try:
+        requests.post(
+            "https://gate.whapi.cloud/messages/text",
+            headers={"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            json={"to": ADMIN_PHONE, "body": (
+                "🔐 *Paylocity necesita código MFA*\n\n"
+                "Reenvíame el código de 6 dígitos que llegó por SMS.\n"
+                "Solo el número (ej: 123456) — tienes 8 minutos."
+            )},
+            timeout=30,
+        )
+    except Exception as e:
+        log(f"whapi send err: {e}")
+        return None
+    # Poll for incoming
+    log("Esperando código MFA por WhatsApp (8 min max)...")
+    chat_id = ADMIN_PHONE + "@s.whatsapp.net"
+    deadline = sent_at + 8 * 60
+    while time.time() < deadline:
+        time.sleep(10)
+        try:
+            r = requests.get(
+                f"https://gate.whapi.cloud/messages/list/{ADMIN_PHONE}",
+                headers={"Authorization": f"Bearer {WHAPI_TOKEN}", "User-Agent": "Mozilla/5.0"},
+                params={"count": 10},
+                timeout=20,
+            )
+            data = r.json()
+            messages = data.get("messages", [])
+            for m in messages:
+                if m.get("from_me"):
+                    continue
+                ts = m.get("timestamp", 0)
+                if ts < sent_at:
+                    continue
+                body = (m.get("text", {}) or {}).get("body", "") if isinstance(m.get("text"), dict) else str(m.get("text", ""))
+                if not body:
+                    body = m.get("body", "") or m.get("caption", "")
+                # Extract 6-digit code
+                match = re.search(r"\b(\d{6})\b", body)
+                if match:
+                    code = match.group(1)
+                    log(f"MFA code received via WA: {code[:2]}****")
+                    return code
+        except Exception as e:
+            log(f"poll err: {e}")
+    log("Timeout waiting for MFA code")
+    return None
+
+
+def handle_mfa_page(page):
+    """When on MFA challenge: request code via WA, input it, check trust device, submit."""
+    log("Handling MFA page...")
+    # Sometimes the page first asks which method to use; click "Send/Text/SMS" option if present
+    for sel in [
+        'button:has-text("Texto")', 'button:has-text("SMS")', 'button:has-text("Text")',
+        'a:has-text("Texto")', 'a:has-text("SMS")', 'input[value*="SMS"]', 'input[value*="Text"]'
+    ]:
+        try:
+            page.click(sel, timeout=2000)
+            log(f"Clicked SMS option: {sel}")
+            page.wait_for_load_state("networkidle", timeout=10000)
+            break
+        except Exception:
+            continue
+    code = whapi_request_mfa_code()
+    if not code:
+        return False
+    # Fill code
+    filled = False
+    for sel in ['input[name*="Code"]', 'input[name*="code"]', 'input[type="tel"]', 'input[name*="otp"]', 'input[name*="Otp"]', 'input[id*="Code"]']:
+        try:
+            page.fill(sel, code, timeout=3000)
+            filled = True
+            log(f"Filled code in: {sel}")
+            break
+        except Exception:
+            continue
+    if not filled:
+        log("Could not find MFA code input")
+        try: page.screenshot(path="screenshot_mfa_input.png")
+        except Exception: pass
+        return False
+    # Try check "Trust this device" checkbox if present
+    for sel in [
+        'input[type="checkbox"][name*="Trust"]', 'input[type="checkbox"][name*="trust"]',
+        'input[type="checkbox"][id*="Trust"]', 'input[type="checkbox"][id*="Remember"]',
+        'label:has-text("Recordar")', 'label:has-text("Trust")', 'label:has-text("Remember")'
+    ]:
+        try:
+            el = page.locator(sel).first
+            if el and el.count() > 0:
+                el.check(timeout=2000)
+                log(f"Checked trust device: {sel}")
+                break
+        except Exception:
+            continue
+    # Submit
+    for sel in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Verify")',
+                'button:has-text("Acceder")', 'button:has-text("Verificar")', 'button:has-text("Submit")',
+                'button:has-text("Continue")', 'button:has-text("Continuar")']:
+        try:
+            page.click(sel, timeout=3000)
+            break
+        except Exception:
+            continue
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        pass
+    cur = page.url.lower()
+    if "mfa" in cur or "challenge" in cur:
+        log(f"Still on MFA: {page.url}")
+        return False
+    log(f"MFA passed → {page.url}")
+    return True
+
+
 def perform_login(page):
     """Returns True on successful EmployeeSearch entry, False if MFA blocked."""
     if not (COMPANY_ID and USERNAME and PASSWORD):
@@ -87,7 +215,6 @@ def perform_login(page):
         return False
     log("Going to login page...")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-    # Wait for company id field — name attribute may vary by language ('CompanyId')
     for sel in ['input[name="CompanyId"]', 'input[name="companyId"]', 'input[id*="Company"]']:
         try:
             page.wait_for_selector(sel, timeout=15000)
@@ -97,33 +224,28 @@ def perform_login(page):
             continue
     for sel in ['input[name="Username"]', 'input[name="username"]']:
         try:
-            page.fill(sel, USERNAME, timeout=8000)
-            break
+            page.fill(sel, USERNAME, timeout=8000); break
         except Exception:
             continue
     for sel in ['input[name="Password"]', 'input[name="password"]', 'input[type="password"]']:
         try:
-            page.fill(sel, PASSWORD, timeout=8000)
-            break
+            page.fill(sel, PASSWORD, timeout=8000); break
         except Exception:
             continue
-    # Click submit
     for sel in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("Acceder")']:
         try:
-            page.click(sel, timeout=5000)
-            break
+            page.click(sel, timeout=5000); break
         except Exception:
             continue
-    # Wait for either MFA challenge or EmployeeSearch / portal home
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
     cur = page.url.lower()
-    content = page.content().lower()
-    if "challenge" in cur or "mfa" in cur or "verify" in cur or "security code" in content or "código de seguridad" in content or "verification code" in content:
-        log(f"MFA challenge detected at {page.url}")
-        return False
+    if "/mfa" in cur or "challenge" in cur or "verify" in cur:
+        log(f"MFA detected at {page.url} — attempting Whapi relay")
+        if not handle_mfa_page(page):
+            return False
     log(f"After login URL: {page.url}")
     return True
 
