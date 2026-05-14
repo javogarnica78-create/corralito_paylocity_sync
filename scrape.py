@@ -106,13 +106,13 @@ def whapi_request_mfa_code():
     except Exception as e:
         log(f"whapi send err: {e}")
         return None
-    # Poll for incoming — ACCEPT ONLY codes sent ≥30s after our request (avoids stale codes)
-    log("Esperando código MFA por WhatsApp (8 min max, filtrando códigos prematuros)...")
+    # Poll for incoming — accept ANY code sent after our request
+    log("Esperando código MFA por WhatsApp (8 min max)...")
     chat_id = f"{ADMIN_PHONE}@s.whatsapp.net"
-    min_accept_ts = sent_at + 30  # Don't accept codes sent before this — likely stale
     deadline = sent_at + 8 * 60
+    poll_interval = 5  # check every 5s for faster response
     while time.time() < deadline:
-        time.sleep(10)
+        time.sleep(poll_interval)
         try:
             r = requests.get(
                 f"https://gate.whapi.cloud/messages/list/{chat_id}",
@@ -126,12 +126,8 @@ def whapi_request_mfa_code():
                 if m.get("from_me"):
                     continue
                 ts = m.get("timestamp", 0)
-                if ts < min_accept_ts:
-                    if ts >= sent_at:
-                        body_q = (m.get("text", {}) or {}).get("body", "") if isinstance(m.get("text"), dict) else str(m.get("text", ""))
-                        if re.search(r"\b\d{5,7}\b", body_q or ""):
-                            log(f"Skipping premature code (sent {min_accept_ts - ts}s before threshold) — likely stale SMS")
-                    continue
+                if ts < sent_at:
+                    continue  # before our request — stale
                 body = (m.get("text", {}) or {}).get("body", "") if isinstance(m.get("text"), dict) else str(m.get("text", ""))
                 if not body:
                     body = m.get("body", "") or m.get("caption", "")
