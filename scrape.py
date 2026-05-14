@@ -150,18 +150,62 @@ def whapi_request_mfa_code():
 def handle_mfa_page(page):
     """When on MFA challenge: request code via WA, input it, check trust device, submit."""
     log("Handling MFA page...")
-    # Sometimes the page first asks which method to use; click "Send/Text/SMS" option if present
+    # Screenshot for debug
+    try:
+        page.screenshot(path="screenshot_mfa_landing.png", full_page=True)
+        log("Saved screenshot_mfa_landing.png")
+    except Exception:
+        pass
+    # Step 1: select SMS/Text method (radio or option)
+    selected = False
     for sel in [
+        'input[type="radio"][value*="SMS"]', 'input[type="radio"][value*="Text"]',
+        'input[type="radio"][value*="sms"]', 'input[type="radio"][value*="text"]',
+        'input[type="radio"][id*="SMS"]', 'input[type="radio"][id*="Text"]',
+        'label:has-text("Mensaje de texto")', 'label:has-text("Text message")',
+        'label:has-text("Texto")', 'label:has-text("SMS")', 'label:has-text("Text")',
         'button:has-text("Texto")', 'button:has-text("SMS")', 'button:has-text("Text")',
-        'a:has-text("Texto")', 'a:has-text("SMS")', 'input[value*="SMS"]', 'input[value*="Text"]'
+        'a:has-text("Texto")', 'a:has-text("SMS")',
     ]:
         try:
             page.click(sel, timeout=2000)
-            log(f"Clicked SMS option: {sel}")
-            page.wait_for_load_state("networkidle", timeout=10000)
+            log(f"Selected SMS option: {sel}")
+            selected = True
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
             break
         except Exception:
             continue
+    # Step 2: click "Continue/Send code" button to trigger SMS
+    sent_btn_clicked = False
+    for sel in [
+        'button:has-text("Enviar código")', 'button:has-text("Send code")',
+        'button:has-text("Continuar")', 'button:has-text("Continue")',
+        'button:has-text("Send")', 'button:has-text("Siguiente")', 'button:has-text("Next")',
+        'input[type="submit"][value*="Continuar"]', 'input[type="submit"][value*="Continue"]',
+        'input[type="submit"][value*="Send"]', 'input[type="submit"][value*="Enviar"]',
+        'button[type="submit"]'
+    ]:
+        try:
+            page.click(sel, timeout=3000)
+            log(f"Clicked send/continue: {sel}")
+            sent_btn_clicked = True
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            break
+        except Exception:
+            continue
+    try:
+        page.screenshot(path="screenshot_mfa_after_send.png", full_page=True)
+        log("Saved screenshot_mfa_after_send.png")
+    except Exception:
+        pass
+    if not selected and not sent_btn_clicked:
+        log("WARN: could not select SMS option nor click send button — SMS may not have triggered")
     code = whapi_request_mfa_code()
     if not code:
         return False
