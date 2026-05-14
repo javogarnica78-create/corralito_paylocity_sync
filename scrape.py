@@ -129,17 +129,17 @@ def whapi_request_mfa_code():
                 if ts < min_accept_ts:
                     if ts >= sent_at:
                         body_q = (m.get("text", {}) or {}).get("body", "") if isinstance(m.get("text"), dict) else str(m.get("text", ""))
-                        if re.search(r"\b\d{6}\b", body_q or ""):
+                        if re.search(r"\b\d{5,7}\b", body_q or ""):
                             log(f"Skipping premature code (sent {min_accept_ts - ts}s before threshold) — likely stale SMS")
                     continue
                 body = (m.get("text", {}) or {}).get("body", "") if isinstance(m.get("text"), dict) else str(m.get("text", ""))
                 if not body:
                     body = m.get("body", "") or m.get("caption", "")
-                # Extract 6-digit code
-                match = re.search(r"\b(\d{6})\b", body)
+                # Extract 5-7 digit code (Paylocity changed to 5)
+                match = re.search(r"\b(\d{5,7})\b", body)
                 if match:
                     code = match.group(1)
-                    log(f"MFA code received via WA at +{ts - sent_at}s: {code[:2]}****")
+                    log(f"MFA code received via WA at +{ts - sent_at}s: {code[:2]}***")
                     return code
         except Exception as e:
             log(f"poll err: {e}")
